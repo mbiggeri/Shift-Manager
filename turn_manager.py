@@ -8,6 +8,7 @@ import datetime
 try:
     from tksheet import Sheet
 except ImportError:
+    print("Sheet not found")
     Sheet = None
 
 # =============================================================================
@@ -20,6 +21,7 @@ class DatabaseManager:
 
     def create_tables(self):
         cursor = self.conn.cursor()
+        
         # Employees table.
         cursor.execute('''CREATE TABLE IF NOT EXISTS employees (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,6 +30,16 @@ class DatabaseManager:
             accumulated_hours INTEGER NOT NULL,
             preferences TEXT NOT NULL
         )''')
+        
+        # Schedules table (to save a schedule snapshot)
+        cursor.execute('''CREATE TABLE IF NOT EXISTS schedules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            year INTEGER NOT NULL,
+            month INTEGER NOT NULL,
+            schedule TEXT NOT NULL,
+            UNIQUE(year, month)
+        )''')
+
         # Shifts table.
         cursor.execute('''CREATE TABLE IF NOT EXISTS shifts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,6 +48,7 @@ class DatabaseManager:
             employee_id INTEGER NOT NULL,
             FOREIGN KEY(employee_id) REFERENCES employees(id)
         )''')
+        
         # Absences table.
         cursor.execute('''CREATE TABLE IF NOT EXISTS absences (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,11 +58,13 @@ class DatabaseManager:
             absence_type TEXT NOT NULL,
             FOREIGN KEY(employee_id) REFERENCES employees(id)
         )''')
+        
         # Settings table.
         cursor.execute('''CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
         )''')
+        
         # Insert default settings if they do not already exist.
         defaults = {
             'default_target_hours': '160',
@@ -133,6 +148,12 @@ class DatabaseManager:
             end_date = f"{year}-{month+1:02d}-01"
         cursor.execute('''DELETE FROM shifts WHERE shift_date >= ? AND shift_date < ?''', (start_date, end_date))
         self.conn.commit()
+    
+    def update_shift_assignment(self, shift_id, employee_id):
+        cursor = self.conn.cursor()
+        cursor.execute("UPDATE shifts SET employee_id = ? WHERE id = ?", (employee_id, shift_id))
+        self.conn.commit()
+
 
     # ----- Absence Operations -----
     def add_absence(self, employee_id, start_date, end_date, absence_type):
@@ -180,6 +201,92 @@ class DatabaseManager:
         cursor.execute("SELECT key, value FROM settings")
         rows = cursor.fetchall()
         return {key: value for key, value in rows}
+    
+    # ----- Schedule Operations -----
+    def save_schedule(self, year, month, schedule_json):
+        cursor = self.conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO schedules (year, month, schedule) VALUES (?, ?, ?)",
+                       (year, month, schedule_json))
+        self.conn.commit()
+        
+    def get_schedule(self, year, month):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT schedule FROM schedules WHERE year=? AND month=?", (year, month))
+        row = cursor.fetchone()
+        return json.loads(row[0]) if row else None
+    
+    def delete_schedule_snapshot(self, year, month):
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM schedules WHERE year=? AND month=?", (year, month))
+        self.conn.commit()
+
+
+    # ----- Statistics Operations -----
+    def update_employee_statistics(self):
+        """
+        For all shifts that occurred on or before today, group them by employee and by month.
+        For every month that is complete (the last day of that month is before today),
+        calculate the extra hours worked (total_hours - target_hours).
+        Then update the employee's accumulated_hours to reflect the extra hours.
+        (This method recalculates from scratch for all completed months.)
+        """
+        cursor = self.conn.cursor()
+        today = datetime.date.today()
+
+        # Get all shifts with a date on or before today.
+        cursor.execute('''
+            SELECT employee_id, shift_date, shift_type FROM shifts 
+            WHERE shift_date <= ?
+        ''', (today.strftime("%Y-%m-%d"),))
+        shifts = cursor.fetchall()
+
+        # Get shift durations from settings.
+        duration_morning = int(self.get_setting("duration_morning"))
+        duration_afternoon = int(self.get_setting("duration_afternoon"))
+        duration_night = int(self.get_setting("duration_night"))
+        shift_duration_map = {
+            "Morning": duration_morning,
+            "Afternoon": duration_afternoon,
+            "Night": duration_night
+        }
+
+        # Group shifts by employee and by month.
+        # Use a dict with keys (employee_id, year, month) and sum hours.
+        worked = {}
+        for employee_id, shift_date, shift_type in shifts:
+            dt = datetime.datetime.strptime(shift_date, "%Y-%m-%d").date()
+            key = (employee_id, dt.year, dt.month)
+            worked.setdefault(key, 0)
+            worked[key] += shift_duration_map.get(shift_type, 8)
+
+        # For each employee, sum the extra hours from every complete month.
+        # A month is considered complete if its last day is before today.
+        extra_hours_by_emp = {}
+        for (employee_id, year, month), total_hours in worked.items():
+            # Compute last day of the month.
+            if month == 12:
+                next_month = datetime.date(year + 1, 1, 1)
+            else:
+                next_month = datetime.date(year, month + 1, 1)
+            last_day_of_month = next_month - datetime.timedelta(days=1)
+
+            if last_day_of_month < today:
+                # Get the target hours for the employee.
+                cursor.execute("SELECT target_hours FROM employees WHERE id=?", (employee_id,))
+                result = cursor.fetchone()
+                if result:
+                    target_hours = result[0]
+                    extra = total_hours - target_hours
+                    if extra > 0:
+                        extra_hours_by_emp.setdefault(employee_id, 0)
+                        extra_hours_by_emp[employee_id] += extra
+
+        # Now update each employee's accumulated_hours.
+        # For simplicity, we set accumulated_hours equal to the computed extra hours.
+        for employee_id, extra in extra_hours_by_emp.items():
+            cursor.execute("UPDATE employees SET accumulated_hours=? WHERE id=?", (extra, employee_id))
+        self.conn.commit()
+
 
 # =============================================================================
 # Employee Dialog (for Adding/Editing)
@@ -353,46 +460,91 @@ class ScheduleTab(tk.Frame):
         self.db_manager = db_manager
         self.shift_types = ["Morning", "Afternoon", "Night"]
 
-        # In the ScheduleTab __init__ method:
+        # --- Control Frame (Year, Month, Buttons, Filter) ---
         control_frame = tk.Frame(self)
         control_frame.pack(pady=10)
-        tk.Label(control_frame, text="Year:").pack(side=tk.LEFT)
-        self.year_var = tk.IntVar(value=datetime.datetime.now().year)
-        tk.Entry(control_frame, textvariable=self.year_var, width=5).pack(side=tk.LEFT, padx=5)
-        tk.Label(control_frame, text="Month:").pack(side=tk.LEFT)
-        self.month_var = tk.IntVar(value=datetime.datetime.now().month)
-        tk.Entry(control_frame, textvariable=self.month_var, width=3).pack(side=tk.LEFT, padx=5)
+        
+        # Create a navigation area to select the month
+        self.current_date = datetime.date.today().replace(day=1)
+        
+        # Button to go to the previous month
+        self.prev_button = tk.Button(control_frame, text="<", command=self.prev_month)
+        self.prev_button.pack(side=tk.LEFT, padx=5)
+        
+        # Label to display the current month and year
+        self.date_label = tk.Label(control_frame, text=self.current_date.strftime("%B %Y"), font=("Arial", 12))
+        self.date_label.pack(side=tk.LEFT, padx=5)
+        
+        # Button to go to the next month
+        self.next_button = tk.Button(control_frame, text=">", command=self.next_month)
+        self.next_button.pack(side=tk.LEFT, padx=5)
+        
         tk.Button(control_frame, text="Generate Schedule", command=self.generate_schedule).pack(side=tk.LEFT, padx=10)
         tk.Button(control_frame, text="Clear Schedule", command=self.clear_schedule).pack(side=tk.LEFT, padx=5)
         tk.Button(control_frame, text="Update Schedule", command=self.update_schedule).pack(side=tk.LEFT, padx=5)
+        tk.Label(control_frame, text="Filter by Employee:").pack(side=tk.LEFT, padx=5)
+        self.employee_filter_var = tk.StringVar()
+        # Build a list with an "All" option plus every employee.
+        employees = self.db_manager.get_employees()
+        employee_options = ["All"] + [f"{emp['id']}: {emp['name']}" for emp in employees]
+        self.employee_filter_combo = ttk.Combobox(control_frame, textvariable=self.employee_filter_var,
+                                                  values=employee_options, state="readonly")
+        self.employee_filter_combo.pack(side=tk.LEFT, padx=5)
+        self.employee_filter_combo.current(0)
+        tk.Button(control_frame, text="Filter Schedule", command=self.filter_schedule).pack(side=tk.LEFT, padx=5)
 
+        # --- Create the Schedule Display Widget ---
         self.schedule_frame = tk.Frame(self)
         self.schedule_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         if Sheet:
             self.sheet = Sheet(self.schedule_frame, headers=["Date"] + self.shift_types, height=300)
-            self.sheet.enable_bindings()
             self.sheet.pack(fill=tk.BOTH, expand=True)
+            self.sheet.enable_bindings()
+            self.sheet.extra_begin_edit_cell_command = self.edit_cell_command
         else:
             columns = ("date",) + tuple(self.shift_types)
             self.tree = ttk.Treeview(self.schedule_frame, columns=columns, show="headings")
             for col in columns:
                 self.tree.heading(col, text=col.title())
             self.tree.pack(fill=tk.BOTH, expand=True)
+            self.tree.bind("<Double-1>", self.edit_treeview_cell)
+
+        # Load the saved schedule (if any) for the current month.
+        self.load_saved_schedule()
+
+        
+        # Load a saved schedule (if any) for the selected month.
+        self.load_saved_schedule()
 
     def clear_schedule(self):
-        year = self.year_var.get()
-        month = self.month_var.get()
+        # Use the current_date attribute from the arrow menu navigation.
+        year = self.current_date.year
+        month = self.current_date.month
+
+        # Delete all shifts for the selected month.
         self.db_manager.clear_shifts_for_month(year, month)
+
+        # Remove the saved schedule snapshot from the database.
+        self.db_manager.delete_schedule_snapshot(year, month)
+
+        # Update employee statistics to reflect the changes.
+        # (Make sure your update_employee_statistics method recalculates totals based on existing shifts.)
+        self.db_manager.update_employee_statistics()
+
+        # Clear the schedule display.
         if Sheet:
             self.sheet.set_sheet_data([])
         else:
             for row in self.tree.get_children():
                 self.tree.delete(row)
-        messagebox.showinfo("Success", "Schedule cleared for the selected month.")
+
+        messagebox.showinfo("Success", "Schedule for the selected month has been cleared and statistics updated.")
 
     def generate_schedule(self):
-        year = self.year_var.get()
-        month = self.month_var.get()
+        # Use the current_date from the arrow menu
+        year = self.current_date.year
+        month = self.current_date.month
+        
         try:
             self.db_manager.clear_shifts_for_month(year, month)
             employees_data = self.db_manager.get_employees()
@@ -499,6 +651,10 @@ class ScheduleTab(tk.Frame):
                 messagebox.showwarning("Warning", f"Some shifts may be understaffed:\n{warnings_text}")
             else:
                 messagebox.showinfo("Success", "Schedule generated and saved successfully.")
+                
+            # Save the schedule (as JSON) into the database
+            self.db_manager.save_schedule(year, month, json.dumps(schedule))
+            
         except Exception as e:
             messagebox.showerror("Error", f"Failed to generate schedule: {e}")
 
@@ -667,8 +823,144 @@ class ScheduleTab(tk.Frame):
                 for row in sheet_data:
                     self.tree.insert("", "end", values=row)
             messagebox.showinfo("Update Complete", f"Schedule updated. {changes} shift(s) changed.")
+        
+            # Save the schedule (as JSON) into the database
+            self.db_manager.save_schedule(year, month, json.dumps(schedule))
+            
         except Exception as e:
             messagebox.showerror("Error", f"Failed to update schedule: {e}")
+
+    def edit_cell_command(self, event):
+        # event is expected to be a tuple like (widget, row, col, ...)
+        row, col = event[1], event[2]
+        if col == 0:  # Skip editing the Date column
+            return
+        shift_type = self.shift_types[col - 1]
+        date_str = self.sheet.get_cell_data(row, 0)
+        # Get the corresponding shift record from the database
+        cursor = self.db_manager.conn.cursor()
+        cursor.execute("SELECT id, employee_id FROM shifts WHERE shift_date=? AND shift_type=?", (date_str, shift_type))
+        record = cursor.fetchone()
+        if not record:
+            return
+        shift_id, current_emp_id = record
+        # Open the drop-down selection dialog:
+        dialog = EmployeeSelectionDialog(self, self.db_manager, current_emp_id)
+        self.wait_window(dialog)
+        if dialog.result:
+            new_emp_id = dialog.result
+            self.db_manager.update_shift_assignment(shift_id, new_emp_id)
+            cursor.execute("SELECT name FROM employees WHERE id=?", (new_emp_id,))
+            new_emp_name = cursor.fetchone()[0]
+            self.sheet.set_cell_data(row, col, new_emp_name)
+
+    def filter_schedule(self):
+        selected = self.employee_filter_var.get()
+        year = self.year_var.get()
+        month = self.month_var.get()
+        if selected == "All":
+            # Re–generate full schedule if "All" is selected
+            self.generate_schedule()
+            return
+        emp_id = int(selected.split(":")[0])
+        # Get all shifts for the month
+        shifts = self.db_manager.get_shifts_for_month(year, month)
+        # Build a filtered schedule dictionary with only the selected employee's shifts
+        schedule = {}
+        for shift in shifts:
+            shift_id, shift_date, shift_type, employee_id, emp_name = shift
+            if employee_id == emp_id:
+                if shift_date not in schedule:
+                    schedule[shift_date] = {}
+                schedule[shift_date][shift_type] = emp_name
+        # Build the sheet (or treeview) data accordingly:
+        sheet_data = []
+        first_day = datetime.date(year, month, 1)
+        if month == 12:
+            next_month = datetime.date(year+1, 1, 1)
+        else:
+            next_month = datetime.date(year, month+1, 1)
+        days = (next_month - first_day).days
+        for day in range(1, days + 1):
+            date_str = datetime.date(year, month, day).strftime("%Y-%m-%d")
+            row = [date_str]
+            for shift in self.shift_types:
+                value = schedule.get(date_str, {}).get(shift, "")
+                row.append(value)
+            sheet_data.append(row)
+        if Sheet:
+            self.sheet.set_sheet_data(sheet_data)
+        else:
+            for row in self.tree.get_children():
+                self.tree.delete(row)
+            for row in sheet_data:
+                self.tree.insert("", "end", values=row)
+
+    def edit_treeview_cell(self, event):
+        # Placeholder for Treeview cell editing.
+        messagebox.showinfo("Info", "Treeview cell editing not implemented.")
+
+    def load_saved_schedule(self):
+        year = self.current_date.year
+        month = self.current_date.month
+        schedule = self.db_manager.get_schedule(year, month)
+        if schedule:
+            sheet_data = []
+            # Convert the saved schedule dictionary into sheet data.
+            for date_str, shifts in sorted(schedule.items()):
+                row = [date_str]
+                for shift in self.shift_types:
+                    value = shifts.get(shift, "")
+                    if isinstance(value, list):
+                        row.append(", ".join(value))
+                    else:
+                        row.append(value)
+                sheet_data.append(row)
+            if Sheet:
+                self.sheet.set_sheet_data(sheet_data)
+            else:
+                for row in self.tree.get_children():
+                    self.tree.delete(row)
+                for row in sheet_data:
+                    self.tree.insert("", "end", values=row)
+        else:
+            # If no schedule is saved, clear the display.
+            if Sheet:
+                self.sheet.set_sheet_data([])
+            else:
+                for row in self.tree.get_children():
+                    self.tree.delete(row)
+            # Optionally, you can show a message that no schedule exists.
+            # messagebox.showinfo("Info", f"No saved schedule for {self.current_date.strftime('%B %Y')}.")
+
+    def prev_month(self):
+        # Subtract one month from self.current_date.
+        year = self.current_date.year
+        month = self.current_date.month
+        if month == 1:
+            new_year = year - 1
+            new_month = 12
+        else:
+            new_year = year
+            new_month = month - 1
+        self.current_date = datetime.date(new_year, new_month, 1)
+        self.date_label.config(text=self.current_date.strftime("%B %Y"))
+        # Do not update statistics automatically; wait for the user to press the button.
+
+    def next_month(self):
+        # Add one month to self.current_date.
+        year = self.current_date.year
+        month = self.current_date.month
+        if month == 12:
+            new_year = year + 1
+            new_month = 1
+        else:
+            new_year = year
+            new_month = month + 1
+        self.current_date = datetime.date(new_year, new_month, 1)
+        self.date_label.config(text=self.current_date.strftime("%B %Y"))
+        # Do not update statistics automatically.
+
 
 # =============================================================================
 # Absence Dialog (for adding an absence record)
@@ -731,6 +1023,7 @@ class AbsenceDialog(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("Error", f"Invalid input: {e}")
 
+
 # =============================================================================
 # Absences Tab
 # =============================================================================
@@ -781,6 +1074,7 @@ class AbsencesTab(tk.Frame):
             self.db_manager.conn.commit()
             self.refresh_tree()
 
+
 # =============================================================================
 # Settings Tab
 # =============================================================================
@@ -823,6 +1117,7 @@ class SettingsTab(tk.Frame):
         except Exception as e:
             messagebox.showerror("Error", f"Failed to update settings: {e}")
 
+
 # =============================================================================
 # Main Application
 # =============================================================================
@@ -855,34 +1150,78 @@ class ShiftSchedulerApp(tk.Tk):
         self.focus_force()
         self.update_idletasks()
 
+
 # =============================================================================
-# Statistics Tab (unchanged from previous version)
+# Statistics Tab
 # =============================================================================
 class StatsTab(tk.Frame):
     def __init__(self, master, db_manager):
         super().__init__(master)
         self.db_manager = db_manager
-        self.shift_duration = 8  # Not used directly in this tab
-
+        self.shift_duration = 8  # Or use a setting if desired
+        
+        # Initialize current_date to the first day of the current month.
+        self.current_date = datetime.date.today().replace(day=1)
+        
+        # Build the control frame with arrow buttons and a label.
         control_frame = tk.Frame(self)
         control_frame.pack(pady=10)
-        tk.Label(control_frame, text="Year:").pack(side=tk.LEFT)
-        self.year_var = tk.IntVar(value=datetime.datetime.now().year)
-        tk.Entry(control_frame, textvariable=self.year_var, width=5).pack(side=tk.LEFT, padx=5)
-        tk.Label(control_frame, text="Month:").pack(side=tk.LEFT)
-        self.month_var = tk.IntVar(value=datetime.datetime.now().month)
-        tk.Entry(control_frame, textvariable=self.month_var, width=3).pack(side=tk.LEFT, padx=5)
+        
+        self.prev_button = tk.Button(control_frame, text="<", command=self.prev_month)
+        self.prev_button.pack(side=tk.LEFT, padx=5)
+        
+        self.date_label = tk.Label(control_frame, text=self.current_date.strftime("%B %Y"), font=("Arial", 12))
+        self.date_label.pack(side=tk.LEFT, padx=5)
+        
+        self.next_button = tk.Button(control_frame, text=">", command=self.next_month)
+        self.next_button.pack(side=tk.LEFT, padx=5)
+        
+        # Show/Update Statistics button.
         tk.Button(control_frame, text="Show Statistics", command=self.show_stats).pack(side=tk.LEFT, padx=10)
-
+        
+        # Create the treeview to display statistics.
         columns = ("Employee", "Shifts Worked", "Hours Worked", "Target Hours", "Accumulated Hours")
         self.tree = ttk.Treeview(self, columns=columns, show="headings")
         for col in columns:
             self.tree.heading(col, text=col)
         self.tree.pack(fill=tk.BOTH, expand=True, pady=10)
-
+        
+    def prev_month(self):
+        # Subtract one month from self.current_date.
+        year = self.current_date.year
+        month = self.current_date.month
+        if month == 1:
+            new_year = year - 1
+            new_month = 12
+        else:
+            new_year = year
+            new_month = month - 1
+        self.current_date = datetime.date(new_year, new_month, 1)
+        self.date_label.config(text=self.current_date.strftime("%B %Y"))
+        # Optionally, clear the statistics display or wait until "Show Statistics" is pressed.
+    
+    def next_month(self):
+        # Add one month to self.current_date.
+        year = self.current_date.year
+        month = self.current_date.month
+        if month == 12:
+            new_year = year + 1
+            new_month = 1
+        else:
+            new_year = year
+            new_month = month + 1
+        self.current_date = datetime.date(new_year, new_month, 1)
+        self.date_label.config(text=self.current_date.strftime("%B %Y"))
+        # Optionally, clear the statistics display or wait until "Show Statistics" is pressed.
+    
     def show_stats(self):
-        year = self.year_var.get()
-        month = self.month_var.get()
+        # Update statistics based on the current_date.
+        # Optionally, update the employee statistics if needed:
+        self.db_manager.update_employee_statistics()
+        
+        year = self.current_date.year
+        month = self.current_date.month
+        
         shifts = self.db_manager.get_shifts_for_month(year, month)
         stats = {}
         for shift in shifts:
@@ -890,7 +1229,7 @@ class StatsTab(tk.Frame):
             emp_name = shift[4]
             stats.setdefault(emp_id, {"name": emp_name, "shifts": 0})
             stats[emp_id]["shifts"] += 1
-
+        
         employees = self.db_manager.get_employees()
         for emp in employees:
             emp_id = emp["id"]
@@ -902,13 +1241,47 @@ class StatsTab(tk.Frame):
                                  "shifts": 0,
                                  "target": emp["target_hours"],
                                  "accumulated": emp["accumulated_hours"]}
-
+        
+        # Clear existing rows.
         for row in self.tree.get_children():
             self.tree.delete(row)
+        
+        # Insert new rows.
         for stat in stats.values():
             hours_worked = stat["shifts"] * self.shift_duration
             self.tree.insert("", "end", values=(stat["name"], stat["shifts"],
                                                 hours_worked, stat["target"], stat["accumulated"]))
+
+
+# =============================================================================
+# Employee Selection Dialog
+# =============================================================================
+class EmployeeSelectionDialog(tk.Toplevel):
+    def __init__(self, master, db_manager, current_emp_id):
+        super().__init__(master)
+        self.title("Select Employee")
+        self.db_manager = db_manager
+        self.result = None
+        tk.Label(self, text="Select Employee:").pack(pady=10)
+        self.employee_var = tk.StringVar()
+        employees = self.db_manager.get_employees()
+        self.employee_options = {f"{emp['id']}: {emp['name']}": emp['id'] for emp in employees}
+        self.combo = ttk.Combobox(self, textvariable=self.employee_var,
+                                  values=list(self.employee_options.keys()), state="readonly")
+        self.combo.pack(pady=10)
+        # Set the current employee as the default selection
+        for key, emp_id in self.employee_options.items():
+            if emp_id == current_emp_id:
+                self.combo.set(key)
+                break
+        tk.Button(self, text="OK", command=self.on_ok).pack(pady=10)
+
+    def on_ok(self):
+        emp_key = self.employee_var.get()
+        if emp_key:
+            self.result = self.employee_options[emp_key]
+        self.destroy()
+
 
 # =============================================================================
 # Run the Application

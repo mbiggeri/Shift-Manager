@@ -59,6 +59,15 @@ class DatabaseManager:
             FOREIGN KEY(employee_id) REFERENCES employees(id)
         )''')
         
+        # Festivities table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS festivities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                is_working_day INTEGER NOT NULL
+            )
+        ''')
+        
         # Settings table.
         cursor.execute('''CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -183,6 +192,35 @@ class DatabaseManager:
             }
             absences.append(absence)
         return absences
+    
+    
+    # ----- Absence Operations -----
+    def add_festivity(self, date_str, is_working_day=True):
+        """
+        Insert a single festivity date, marking whether it's a working day or not.
+        is_working_day is a boolean; store as 1 or 0.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute('INSERT INTO festivities (date, is_working_day) VALUES (?, ?)', 
+                    (date_str, 1 if is_working_day else 0))
+        self.conn.commit()
+
+    def get_festivities_for_month(self, year, month):
+        """
+        Return a dict where keys are 'YYYY-MM-DD' and values are True/False for is_working_day.
+        """
+        start_date = f"{year}-{month:02d}-01"
+        if month == 12:
+            end_date = f"{year+1}-01-01"
+        else:
+            end_date = f"{year}-{month+1:02d}-01"
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT date, is_working_day FROM festivities WHERE date >= ? AND date < ?',
+                    (start_date, end_date))
+        rows = cursor.fetchall()
+        # Convert to a dict: {'2025-12-25': False, ...}
+        return {row[0]: bool(row[1]) for row in rows}
+
 
     # ----- Settings Operations -----
     def get_setting(self, key):
@@ -484,6 +522,7 @@ class ScheduleTab(tk.Frame):
         tk.Button(control_frame, text="Update Schedule", command=self.update_schedule).pack(side=tk.LEFT, padx=5)
         tk.Label(control_frame, text="Filter by Employee:").pack(side=tk.LEFT, padx=5)
         self.employee_filter_var = tk.StringVar()
+        
         # Build a list with an "All" option plus every employee.
         employees = self.db_manager.get_employees()
         employee_options = ["All"] + [f"{emp['id']}: {emp['name']}" for emp in employees]
@@ -512,10 +551,6 @@ class ScheduleTab(tk.Frame):
         # Load the saved schedule (if any) for the current month.
         self.load_saved_schedule()
 
-        
-        # Load a saved schedule (if any) for the selected month.
-        self.load_saved_schedule()
-
     def clear_schedule(self):
         # Use the current_date attribute from the arrow menu navigation.
         year = self.current_date.year
@@ -541,33 +576,40 @@ class ScheduleTab(tk.Frame):
         messagebox.showinfo("Success", "Schedule for the selected month has been cleared and statistics updated.")
 
     def generate_schedule(self):
-        # Use the current_date from the arrow menu
+        # Use self.current_date (the date shown on the label)
         year = self.current_date.year
         month = self.current_date.month
-        
+
         try:
+            # Clear existing SHIFT records in DB for this month
             self.db_manager.clear_shifts_for_month(year, month)
+
+            # Grab employees
             employees_data = self.db_manager.get_employees()
             if not employees_data:
                 messagebox.showwarning("No Employees", "No employees available for scheduling.")
                 return
 
+            # Grab shift "staffing" (i.e. how many employees needed per shift)
             staffing = {
                 "Morning": int(self.db_manager.get_setting("staffing_morning")),
                 "Afternoon": int(self.db_manager.get_setting("staffing_afternoon")),
                 "Night": int(self.db_manager.get_setting("staffing_night"))
             }
+
+            # Grab shift durations
             shift_durations = {
                 "Morning": int(self.db_manager.get_setting("duration_morning")),
                 "Afternoon": int(self.db_manager.get_setting("duration_afternoon")),
                 "Night": int(self.db_manager.get_setting("duration_night"))
             }
 
-            # Load absences for the month.
+            # Load absences for the month, build a helper to check if absent
             absences_list = self.db_manager.get_absences_for_month(year, month)
             absences_by_employee = {}
             for a in absences_list:
                 absences_by_employee.setdefault(a["employee_id"], []).append(a)
+
             def is_employee_absent(emp_id, date_obj):
                 if emp_id not in absences_by_employee:
                     return False
@@ -576,7 +618,10 @@ class ScheduleTab(tk.Frame):
                         return True
                 return False
 
-            # Lightweight employee object.
+            # Load festivities for the month => {date_str: True/False} => True = working day, False = non-working
+            festivities = self.db_manager.get_festivities_for_month(year, month)
+
+            # Build a lightweight employee class to track assigned_hours
             class Emp:
                 def __init__(self, data):
                     self.id = data["id"]
@@ -584,77 +629,106 @@ class ScheduleTab(tk.Frame):
                     self.target_hours = data["target_hours"]
                     self.accumulated_hours = data["accumulated_hours"]
                     self.preferences = data["preferences"]
-                    self.assigned_hours = 0
-                    self.assignments = {}  # date_str -> list of shifts
+                    self.assigned_hours = 0  # For newly assigned shifts this month
+
                 def remaining_hours(self):
                     return (self.target_hours - self.accumulated_hours) - self.assigned_hours
 
-            employees = [Emp(data) for data in employees_data]
+            employees = [Emp(e) for e in employees_data]
 
+            # Compute how many days in the selected month
             first_day = datetime.date(year, month, 1)
             if month == 12:
-                next_month = datetime.date(year+1, 1, 1)
+                next_month = datetime.date(year + 1, 1, 1)
             else:
-                next_month = datetime.date(year, month+1, 1)
+                next_month = datetime.date(year, month + 1, 1)
             days = (next_month - first_day).days
 
-            warnings_list = []  # to collect staffing warnings.
+            # Prepare a dictionary for the schedule => { date_str: {shift_type: [employee_names...] } }
             schedule = {}
+            warnings_list = []
+
             for day in range(1, days + 1):
                 current_date = datetime.date(year, month, day)
                 date_str = current_date.strftime("%Y-%m-%d")
+
+                # Check if it's a festivity *and* non-working day => skip assignment
+                if date_str in festivities and festivities[date_str] == False:
+                    # Non-working festivity => store empty day, no shifts assigned
+                    schedule[date_str] = {}
+                    continue
+
+                # Otherwise, proceed with normal assignment
                 schedule[date_str] = {}
                 for shift in self.shift_types:
                     needed = staffing.get(shift, 0)
-                    # Exclude employees who are absent today.
+                    # Filter employees who are NOT absent
                     eligible = [e for e in employees if not is_employee_absent(e.id, current_date)]
                     if not eligible:
-                        warnings_list.append(f"No eligible employees for {shift} on {date_str}.")
-                        assigned = []
-                    else:
-                        # Sort eligible employees by (preference, remaining hours).
-                        candidates = sorted(eligible,
-                                            key=lambda e: (e.preferences.get(shift, 1), e.remaining_hours()),
-                                            reverse=True)
-                        if len(candidates) < needed:
-                            warnings_list.append(f"Not enough unique employees for {shift} on {date_str}. Filling with top candidate.")
-                            extra_needed = needed - len(candidates)
-                            candidates.extend([candidates[0]] * extra_needed)
-                        assigned = candidates[:needed]
-                        for e in assigned:
-                            e.assigned_hours += shift_durations.get(shift, 8)
-                            if date_str in e.assignments:
-                                e.assignments[date_str].append(shift)
-                            else:
-                                e.assignments[date_str] = [shift]
-                            self.db_manager.add_shift(date_str, shift, e.id)
-                    schedule[date_str][shift] = [e.name for e in assigned]
+                        warnings_list.append(f"No eligible employees for {shift} on {date_str}")
+                        schedule[date_str][shift] = []
+                        continue
 
+                    # Sort by (preference, remaining_hours). Higher preference => 2, normal => 1, avoid => 0
+                    # We also want employees with more 'remaining_hours' up front
+                    # so (pref, remaining_hours) in descending order
+                    def sort_key(e):
+                        pref = e.preferences.get(shift, 1)  # default is 1 if not found
+                        return (pref, e.remaining_hours())
+
+                    sorted_candidates = sorted(eligible, key=sort_key, reverse=True)
+
+                    # If fewer unique candidates than needed, we fill with top candidate again => under-staffed warning
+                    if len(sorted_candidates) < needed:
+                        warnings_list.append(f"Not enough employees for {shift} on {date_str}; re-using top candidate")
+                        # We can do something like:
+                        extra_needed = needed - len(sorted_candidates)
+                        assigned = sorted_candidates + [sorted_candidates[0]] * extra_needed
+                    else:
+                        assigned = sorted_candidates[:needed]
+
+                    # Now record their assignment in DB and local schedule
+                    assigned_names = []
+                    for e in assigned:
+                        e.assigned_hours += shift_durations.get(shift, 8)
+                        # Insert shift record in DB
+                        self.db_manager.add_shift(date_str, shift, e.id)
+                        assigned_names.append(e.name)
+
+                    # Put the assigned names in the schedule dictionary
+                    schedule[date_str][shift] = assigned_names
+
+            # Build the data for displaying in tksheet or treeview
             sheet_data = []
-            for date_str, shifts in sorted(schedule.items()):
+            for date_str in sorted(schedule.keys()):
                 row = [date_str]
                 for shift in self.shift_types:
-                    names = shifts.get(shift, [])
-                    row.append(", ".join(names))
+                    emp_list = schedule[date_str].get(shift, [])
+                    row.append(", ".join(emp_list))
                 sheet_data.append(row)
 
+            # Update the UI
             if Sheet:
                 self.sheet.set_sheet_data(sheet_data)
+                # Optionally highlight working vs. non-working festivity rows
+                self.highlight_festivity_rows(sheet_data, festivities)
             else:
+                # Treeview fallback
                 for row in self.tree.get_children():
                     self.tree.delete(row)
                 for row in sheet_data:
-                    self.tree.insert("", "end", values=row)
+                    self.insert_festivity_treeview_row(row, festivities)
 
+            # Show any warnings or success
             if warnings_list:
-                warnings_text = "\n".join(warnings_list)
-                messagebox.showwarning("Warning", f"Some shifts may be understaffed:\n{warnings_text}")
+                msg = "\n".join(warnings_list)
+                messagebox.showwarning("Warning", f"Some issues occurred:\n{msg}")
             else:
-                messagebox.showinfo("Success", "Schedule generated and saved successfully.")
-                
-            # Save the schedule (as JSON) into the database
+                messagebox.showinfo("Success", "Schedule generated successfully.")
+
+            # Save the schedule to the 'schedules' table
             self.db_manager.save_schedule(year, month, json.dumps(schedule))
-            
+
         except Exception as e:
             messagebox.showerror("Error", f"Failed to generate schedule: {e}")
 
@@ -897,8 +971,55 @@ class ScheduleTab(tk.Frame):
                 self.tree.insert("", "end", values=row)
 
     def edit_treeview_cell(self, event):
-        # Placeholder for Treeview cell editing.
-        messagebox.showinfo("Info", "Treeview cell editing not implemented.")
+        # Figure out which row and column are clicked.
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+
+        selected_item = self.tree.selection()
+        if not selected_item:
+            return
+        # The row in the Treeview
+        item = self.tree.item(selected_item)
+        row_values = item["values"]
+        # Suppose row_values = [date_str, morning_assignment, afternoon_assignment, night_assignment]
+        # The column index (0=Date, 1=Morning, 2=Afternoon, 3=Night)
+        column = self.tree.identify_column(event.x)  # e.g. "#1", "#2", ...
+        col_index = int(column.replace("#", "")) - 1
+        if col_index == 0:
+            # The Date column - skip
+            return
+
+        # Determine which shift was clicked
+        shift_type = self.shift_types[col_index - 1]  # since we have "date" in col 0
+        date_str = row_values[0]
+
+        # Query the shift record
+        cursor = self.db_manager.conn.cursor()
+        cursor.execute("SELECT id, employee_id FROM shifts WHERE shift_date=? AND shift_type=?",
+                    (date_str, shift_type))
+        record = cursor.fetchone()
+        if not record:
+            return
+
+        shift_id, current_emp_id = record
+
+        # Launch the same EmployeeSelectionDialog you use for the tksheet approach
+        dialog = EmployeeSelectionDialog(self, self.db_manager, current_emp_id)
+        self.wait_window(dialog)
+        if dialog.result:
+            new_emp_id = dialog.result
+            self.db_manager.update_shift_assignment(shift_id, new_emp_id)
+
+            # Update the displayed Treeview text
+            cursor.execute("SELECT name FROM employees WHERE id=?", (new_emp_id,))
+            result = cursor.fetchone()
+            new_emp_name = result[0] if result else ""
+
+            # Build a new row_values list with the updated name
+            new_values = list(row_values)
+            new_values[col_index] = new_emp_name
+            self.tree.item(selected_item, values=new_values)
 
     def load_saved_schedule(self):
         year = self.current_date.year
@@ -934,7 +1055,7 @@ class ScheduleTab(tk.Frame):
             # messagebox.showinfo("Info", f"No saved schedule for {self.current_date.strftime('%B %Y')}.")
 
     def prev_month(self):
-        # Subtract one month from self.current_date.
+        # Subtract one month from self.current_date
         year = self.current_date.year
         month = self.current_date.month
         if month == 1:
@@ -943,12 +1064,15 @@ class ScheduleTab(tk.Frame):
         else:
             new_year = year
             new_month = month - 1
+
         self.current_date = datetime.date(new_year, new_month, 1)
         self.date_label.config(text=self.current_date.strftime("%B %Y"))
-        # Do not update statistics automatically; wait for the user to press the button.
+        
+        # Now load any saved schedule (if it exists)
+        self.load_saved_schedule()
 
     def next_month(self):
-        # Add one month to self.current_date.
+        # Add one month to self.current_date
         year = self.current_date.year
         month = self.current_date.month
         if month == 12:
@@ -957,9 +1081,53 @@ class ScheduleTab(tk.Frame):
         else:
             new_year = year
             new_month = month + 1
+
         self.current_date = datetime.date(new_year, new_month, 1)
         self.date_label.config(text=self.current_date.strftime("%B %Y"))
-        # Do not update statistics automatically.
+
+        # Now load any saved schedule (if it exists)
+        self.load_saved_schedule()
+
+    def highlight_festivity_rows(self, sheet_data, festivities):
+        """
+        Color the rows in tksheet:
+        - red background if the day is a non-working festivity
+        - yellow background if the day is a working festivity
+        """
+        for row_index, row_values in enumerate(sheet_data):
+            date_str = row_values[0]
+            if date_str in festivities:
+                # If festivities[date_str] == False => non-working => red
+                # If festivities[date_str] == True  => working => yellow
+                if festivities[date_str]:
+                    bg_color = "yellow"
+                else:
+                    bg_color = "red"
+                # tksheet has highlight_cells() for row or for individual cells
+                self.sheet.highlight_cells(
+                    row=row_index, 
+                    column=0,       # date column only, or skip 'column' to highlight the entire row
+                    bg=bg_color
+                )
+                # If you want to highlight the entire row: 
+                # self.sheet.highlight_cells(row=row_index, bg=bg_color)
+
+    def insert_festivity_treeview_row(self, row_values, festivities):
+        """
+        row_values is something like [date_str, assigned_morning, assigned_afternoon, assigned_night]
+        festivities is dict => date_str -> bool
+        """
+        date_str = row_values[0]
+        if date_str in festivities:
+            is_working = festivities[date_str]
+            if is_working:
+                tags = ("working_fest",)
+            else:
+                tags = ("nonworking_fest",)
+        else:
+            tags = ()
+        
+        self.tree.insert("", "end", values=row_values, tags=tags)
 
 
 # =============================================================================
@@ -1076,6 +1244,150 @@ class AbsencesTab(tk.Frame):
 
 
 # =============================================================================
+# Festivity Dialog
+# =============================================================================
+class FestivityDialog(tk.Toplevel):
+    def __init__(self, master, db_manager, festivity=None):
+        """
+        If 'festivity' is provided, it's a dict or row to edit.
+        Otherwise, we'll treat this as 'add new festivity.'
+        """
+        super().__init__(master)
+        self.db_manager = db_manager
+        self.title("Add/Edit Festivity")
+        self.geometry("300x200")
+        self.grab_set()     # Make this dialog modal
+        self.lift()
+        self.focus_force()
+
+        self.result = None  # We'll store the result here when OK is pressed
+
+        # Festivity Date
+        tk.Label(self, text="Date (YYYY-MM-DD):").pack(pady=5)
+        self.date_entry = tk.Entry(self)
+        self.date_entry.pack(pady=5)
+
+        # Is Working Day?
+        tk.Label(self, text="Is Working Day? (Yes=1, No=0):").pack(pady=5)
+        self.is_working_var = tk.BooleanVar()
+        self.is_working_var.set(True)  # default
+        # If you prefer a Checkbutton:
+        self.working_chk = ttk.Checkbutton(
+            self, text="Check if working day",
+            variable=self.is_working_var
+        )
+        self.working_chk.pack(pady=5)
+
+        # If editing an existing record, populate fields
+        if festivity:
+            self.date_entry.insert(0, festivity["date"])
+            self.is_working_var.set(festivity["is_working_day"])
+
+        # Button row
+        tk.Button(self, text="OK", command=self.on_ok).pack(side=tk.LEFT, padx=10, pady=10)
+        tk.Button(self, text="Cancel", command=self.destroy).pack(side=tk.LEFT, padx=10, pady=10)
+
+    def on_ok(self):
+        try:
+            date_str = self.date_entry.get().strip()
+            if not date_str:
+                raise ValueError("Date cannot be empty.")
+            is_working = self.is_working_var.get()  # Boolean
+            self.result = {
+                "date": date_str,
+                "is_working_day": is_working
+            }
+            self.destroy()
+        except Exception as e:
+            messagebox.showerror("Error", f"Invalid input: {e}")
+
+
+# =============================================================================
+# Festivity Tab
+# =============================================================================
+class FestivitiesTab(tk.Frame):
+    def __init__(self, master, db_manager):
+        super().__init__(master)
+        self.db_manager = db_manager
+
+        columns = ("id", "date", "is_working_day")
+        self.tree = ttk.Treeview(self, columns=columns, show="headings")
+        for col in columns:
+            self.tree.heading(col, text=col.title())
+        self.tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        btn_frame = tk.Frame(self)
+        btn_frame.pack(pady=10)
+        tk.Button(btn_frame, text="Add Festivity", command=self.add_festivity).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Delete Festivity", command=self.delete_festivity).pack(side=tk.LEFT, padx=5)
+        # If you want an Edit button
+        tk.Button(btn_frame, text="Edit Festivity", command=self.edit_festivity).pack(side=tk.LEFT, padx=5)
+
+        self.refresh_tree()
+
+    def refresh_tree(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        cursor = self.db_manager.conn.cursor()
+        cursor.execute("SELECT id, date, is_working_day FROM festivities ORDER BY date")
+        for fest_id, date_str, is_working_day in cursor.fetchall():
+            self.tree.insert("", "end", values=(fest_id, date_str, is_working_day))
+
+    def add_festivity(self):
+        dialog = FestivityDialog(self, self.db_manager)
+        self.wait_window(dialog)
+        if dialog.result:
+            date_str = dialog.result["date"]
+            is_working_day_bool = dialog.result["is_working_day"]
+            self.db_manager.add_festivity(date_str, is_working_day_bool)
+            self.refresh_tree()
+
+    def edit_festivity(self):
+        # First, find the currently selected row
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("No selection", "Please select a festivity to edit.")
+            return
+        item = self.tree.item(selected[0])
+        fest_id, date_str, is_working_day_int = item["values"]
+
+        # Build the 'festivity' dict
+        fest_data = {
+            "id": fest_id,
+            "date": date_str,
+            "is_working_day": bool(is_working_day_int)
+        }
+
+        dialog = FestivityDialog(self, self.db_manager, festivity=fest_data)
+        self.wait_window(dialog)
+        if dialog.result:
+            new_date = dialog.result["date"]
+            new_working_bool = dialog.result["is_working_day"]
+            # Just do an UPDATE in the DB
+            cursor = self.db_manager.conn.cursor()
+            cursor.execute("""
+                UPDATE festivities
+                SET date=?, is_working_day=?
+                WHERE id=?
+            """, (new_date, 1 if new_working_bool else 0, fest_id))
+            self.db_manager.conn.commit()
+            self.refresh_tree()
+
+    def delete_festivity(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("Select Festivity", "Please select a festivity to delete.")
+            return
+        item = self.tree.item(selected[0])
+        fest_id = item["values"][0]
+        if messagebox.askyesno("Confirm Delete", "Are you sure you want to delete this festivity?"):
+            cursor = self.db_manager.conn.cursor()
+            cursor.execute("DELETE FROM festivities WHERE id=?", (fest_id,))
+            self.db_manager.conn.commit()
+            self.refresh_tree()
+
+
+# =============================================================================
 # Settings Tab
 # =============================================================================
 class SettingsTab(tk.Frame):
@@ -1145,6 +1457,10 @@ class ShiftSchedulerApp(tk.Tk):
 
         self.absences_tab = AbsencesTab(notebook, self.db_manager)
         notebook.add(self.absences_tab, text="Absences")
+        
+        self.fest_tab = FestivitiesTab(notebook, self.db_manager)
+        notebook.add(self.fest_tab, text="Festivities")
+
 
         self.lift()
         self.focus_force()
@@ -1180,8 +1496,12 @@ class StatsTab(tk.Frame):
         tk.Button(control_frame, text="Show Statistics", command=self.show_stats).pack(side=tk.LEFT, padx=10)
         
         # Create the treeview to display statistics.
-        columns = ("Employee", "Shifts Worked", "Hours Worked", "Target Hours", "Accumulated Hours")
+        columns = ("Employee", 
+           "Normal Shifts", "Normal Hours", 
+           "Festive Shifts", "Festive Hours", 
+           "Target Hours", "Accumulated Hours")
         self.tree = ttk.Treeview(self, columns=columns, show="headings")
+
         for col in columns:
             self.tree.heading(col, text=col)
         self.tree.pack(fill=tk.BOTH, expand=True, pady=10)
@@ -1215,42 +1535,86 @@ class StatsTab(tk.Frame):
         # Optionally, clear the statistics display or wait until "Show Statistics" is pressed.
     
     def show_stats(self):
-        # Update statistics based on the current_date.
-        # Optionally, update the employee statistics if needed:
+        # 1. Update the accumulated_hours in the DB (optional, if desired).
         self.db_manager.update_employee_statistics()
-        
+
+        # 2. Gather current month's shifts.
         year = self.current_date.year
         month = self.current_date.month
-        
         shifts = self.db_manager.get_shifts_for_month(year, month)
+
+        # 3. Get festivity info for the month: { 'YYYY-MM-DD': True/False for is_working_day }
+        festivity_map = self.db_manager.get_festivities_for_month(year, month)
+
+        # 4. Prepare stats dict.
+        #    We'll store per-employee:
+        #        normal_shifts, normal_hours, fest_shifts, fest_hours, target_hours, accumulated_hours
         stats = {}
-        for shift in shifts:
-            emp_id = shift[3]
-            emp_name = shift[4]
-            stats.setdefault(emp_id, {"name": emp_name, "shifts": 0})
-            stats[emp_id]["shifts"] += 1
         
-        employees = self.db_manager.get_employees()
-        for emp in employees:
-            emp_id = emp["id"]
-            if emp_id in stats:
-                stats[emp_id]["target"] = emp["target_hours"]
-                stats[emp_id]["accumulated"] = emp["accumulated_hours"]
+        # 5. Gather employees to fill in target/accumulated data even if they have 0 shifts
+        all_employees = {e["id"]: e for e in self.db_manager.get_employees()}
+
+        # 6. SHIFT loop: categorize each shift
+        for shift_id, shift_date, shift_type, emp_id, emp_name in shifts:
+            # If not in stats, initialize
+            if emp_id not in stats:
+                stats[emp_id] = {
+                    "name": emp_name,
+                    "normal_shifts": 0,
+                    "normal_hours": 0,
+                    "fest_shifts": 0,
+                    "fest_hours": 0,
+                    "target": all_employees[emp_id]["target_hours"],
+                    "accumulated": all_employees[emp_id]["accumulated_hours"],
+                }
+            # Determine shift duration from settings (morning/afternoon/night).
+            # You already have something like:
+            duration_map = {
+                "Morning": int(self.db_manager.get_setting("duration_morning")),
+                "Afternoon": int(self.db_manager.get_setting("duration_afternoon")),
+                "Night": int(self.db_manager.get_setting("duration_night"))
+            }
+            shift_hours = duration_map.get(shift_type, 8)
+
+            # Check if date is festive
+            # If it's in festivity_map but is_working_day=False => it's a "non-working" festivity.
+            is_festive = False
+            if shift_date in festivity_map:
+                # If is_working_day == False, treat as festive
+                is_festive = not festivity_map[shift_date]
+
+            if is_festive:
+                stats[emp_id]["fest_shifts"] += 1
+                stats[emp_id]["fest_hours"] += shift_hours
             else:
-                stats[emp_id] = {"name": emp["name"],
-                                 "shifts": 0,
-                                 "target": emp["target_hours"],
-                                 "accumulated": emp["accumulated_hours"]}
-        
-        # Clear existing rows.
+                stats[emp_id]["normal_shifts"] += 1
+                stats[emp_id]["normal_hours"] += shift_hours
+
+        # 7. For employees who had no shifts in this month, still fill data
+        for emp_id, emp_data in all_employees.items():
+            if emp_id not in stats:
+                stats[emp_id] = {
+                    "name": emp_data["name"],
+                    "normal_shifts": 0,
+                    "normal_hours": 0,
+                    "fest_shifts": 0,
+                    "fest_hours": 0,
+                    "target": emp_data["target_hours"],
+                    "accumulated": emp_data["accumulated_hours"],
+                }
+
+        # 8. Clear existing rows from the Treeview
         for row in self.tree.get_children():
             self.tree.delete(row)
-        
-        # Insert new rows.
-        for stat in stats.values():
-            hours_worked = stat["shifts"] * self.shift_duration
-            self.tree.insert("", "end", values=(stat["name"], stat["shifts"],
-                                                hours_worked, stat["target"], stat["accumulated"]))
+
+        # 9. Insert updated rows
+        for emp_id, s in stats.items():
+            self.tree.insert("", "end", values=(
+                s["name"],
+                s["normal_shifts"], s["normal_hours"],
+                s["fest_shifts"],   s["fest_hours"],
+                s["target"],        s["accumulated"]
+            ))
 
 
 # =============================================================================
